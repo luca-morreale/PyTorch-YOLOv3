@@ -4,6 +4,7 @@ from models import *
 from utils.utils import *
 from utils.datasets import *
 from utils.parse_config import *
+import numpy as np
 
 import os
 import sys
@@ -18,6 +19,8 @@ from torchvision import transforms
 from torch.autograd import Variable
 import torch.optim as optim
 
+from tensorboardX import SummaryWriter
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--epochs", type=int, default=30, help="number of epochs")
 parser.add_argument("--image_folder", type=str, default="data/samples", help="path to dataset")
@@ -26,6 +29,7 @@ parser.add_argument("--model_config_path", type=str, default="config/yolov3.cfg"
 parser.add_argument("--data_config_path", type=str, default="config/coco.data", help="path to data config file")
 parser.add_argument("--weights_path", type=str, default="weights/yolov3.weights", help="path to weights file")
 parser.add_argument("--class_path", type=str, default="data/coco.names", help="path to class label file")
+parser.add_argument("--class_weights", type=str, default="weights/class_weights.txt", help="path to class weights file")
 parser.add_argument("--conf_thres", type=float, default=0.8, help="object confidence threshold")
 parser.add_argument("--nms_thres", type=float, default=0.4, help="iou thresshold for non-maximum suppression")
 parser.add_argument("--n_cpu", type=int, default=0, help="number of cpu threads to use during batch generation")
@@ -44,6 +48,7 @@ os.makedirs("output", exist_ok=True)
 os.makedirs("checkpoints", exist_ok=True)
 
 classes = load_classes(opt.class_path)
+class_weights = load_class_weights(opt.class_weights)
 
 # Get data configuration
 data_config = parse_data_config(opt.data_config_path)
@@ -56,8 +61,11 @@ momentum = float(hyperparams["momentum"])
 decay = float(hyperparams["decay"])
 burn_in = int(hyperparams["burn_in"])
 
+writer = SummaryWriter()
+np.warnings.filterwarnings('ignore')
+
 # Initiate model
-model = Darknet(opt.model_config_path)
+model = Darknet(opt.model_config_path, writer, class_weights=class_weights)
 # model.load_weights(opt.weights_path)
 model.apply(weights_init_normal)
 
@@ -75,6 +83,7 @@ Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
 optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()))
 
+n_iter = 0
 for epoch in range(opt.epochs):
     for batch_i, (_, imgs, targets) in enumerate(dataloader):
         imgs = Variable(imgs.type(Tensor))
@@ -107,6 +116,7 @@ for epoch in range(opt.epochs):
         )
 
         model.seen += imgs.size(0)
+        n_iter += 1
 
-    if epoch % opt.checkpoint_interval == 0:
-        model.save_weights("%s/%d.weights" % (opt.checkpoint_dir, epoch))
+        if n_iter % opt.checkpoint_interval == 0:
+            model.save_weights("%s/%d.weights" % (opt.checkpoint_dir, n_iter))
