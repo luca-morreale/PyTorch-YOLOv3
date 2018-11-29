@@ -19,6 +19,14 @@ def load_classes(path):
     names = fp.read().split("\n")[:-1]
     return names
 
+def load_class_weights(path):
+    fp = open(path, 'r')
+    weights = fp.read().split('\n')
+    weights = [float(weight) for weight in weights]
+
+    return torch.FloatTensor(weights)
+
+
 
 def weights_init_normal(m):
     classname = m.__class__.__name__
