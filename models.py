@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 
-def create_modules(module_defs):
+def create_modules(module_defs, monitor, class_weights):
     """
     Constructs module list of layer blocks from module configuration in module_defs
     """
@@ -76,13 +76,13 @@ def create_modules(module_defs):
         elif module_def["type"] == "yolo":
             anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
             # Extract anchors
-            anchors = [int(x) for x in module_def["anchors"].split(",")]
+            anchors = [int(float(x)) for x in module_def["anchors"].split(",")]
             anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
             anchors = [anchors[i] for i in anchor_idxs]
             num_classes = int(module_def["classes"])
             img_height = int(hyperparams["height"])
             # Define detection layer
-            yolo_layer = YOLOLayer(anchors, num_classes, img_height)
+            yolo_layer = YOLOLayer(anchors, num_classes, img_height, monitor, class_weights)
             modules.add_module("yolo_%d" % i, yolo_layer)
         # Register module list and number of output filters
         module_list.append(modules)
@@ -101,7 +101,7 @@ class EmptyLayer(nn.Module):
 class YOLOLayer(nn.Module):
     """Detection layer"""
 
-    def __init__(self, anchors, num_classes, img_dim):
+    def __init__(self, anchors, num_classes, img_dim, monitor, class_weights=None):
         super(YOLOLayer, self).__init__()
         self.anchors = anchors
         self.num_anchors = len(anchors)
@@ -111,9 +111,16 @@ class YOLOLayer(nn.Module):
         self.ignore_thres = 0.5
         self.lambda_coord = 1
 
+        self.monitor = monitor
+        self.n_iter = 0
+
         self.mse_loss = nn.MSELoss(size_average=True)  # Coordinate loss
         self.bce_loss = nn.BCELoss(size_average=True)  # Confidence loss
         self.ce_loss = nn.CrossEntropyLoss()  # Class loss
+        if class_weights is None:
+            self.nll_loss = nn.NLLLoss(size_average=True)
+        else:
+            self.nll_loss = nn.NLLLoss(size_average=True, weight=class_weights)
 
     def forward(self, x, targets=None):
         nA = self.num_anchors
@@ -173,7 +180,7 @@ class YOLOLayer(nn.Module):
 
             nProposals = int((pred_conf > 0.5).sum().item())
             recall = float(nCorrect / nGT) if nGT else 1
-            precision = float(nCorrect / nProposals)
+            precision = float(nCorrect / nProposals) if nProposals > 0 else float('NaN')
 
             # Handle masks
             mask = Variable(mask.type(ByteTensor))
@@ -196,11 +203,32 @@ class YOLOLayer(nn.Module):
             loss_y = self.mse_loss(y[mask], ty[mask])
             loss_w = self.mse_loss(w[mask], tw[mask])
             loss_h = self.mse_loss(h[mask], th[mask])
-            loss_conf = self.bce_loss(pred_conf[conf_mask_false], tconf[conf_mask_false]) + self.bce_loss(
-                pred_conf[conf_mask_true], tconf[conf_mask_true]
-            )
-            loss_cls = (1 / nB) * self.ce_loss(pred_cls[mask], torch.argmax(tcls[mask], 1))
+
+            self.monitor.add_scalar('yolov3/loss_x', loss_x, self.n_iter)
+            self.monitor.add_scalar('yolov3/loss_y', loss_y, self.n_iter)
+            self.monitor.add_scalar('yolov3/loss_w', loss_w, self.n_iter)
+            self.monitor.add_scalar('yolov3/loss_h', loss_h, self.n_iter)
+            self.monitor.add_scalar('yolov3/coord_loss', (loss_x + loss_y + loss_w + loss_h) / 4.0, self.n_iter)
+
+            loss_no_obj = self.bce_loss(pred_conf[conf_mask_false], tconf[conf_mask_false])
+            loss_obj = self.bce_loss(pred_conf[conf_mask_true], tconf[conf_mask_true])
+            loss_conf = loss_no_obj + loss_obj
+
+            self.monitor.add_scalar('yolov3/no_obj_loss', loss_no_obj, self.n_iter)
+            self.monitor.add_scalar('yolov3/obj_loss',    loss_obj,    self.n_iter)
+            self.monitor.add_scalar('yolov3/conf_loss',   loss_conf,   self.n_iter)
+
+            if torch.max(mask) > 0:
+                loss_cls = (1 / nB) * self.ce_loss(pred_cls[mask], torch.argmax(tcls[mask], 1))
+                self.monitor.add_scalar('yolov3/class_loss', loss_cls, self.n_iter)
+            else:
+                loss_cls = loss_x
+                print(loss_x)
+
             loss = loss_x + loss_y + loss_w + loss_h + loss_conf + loss_cls
+            self.monitor.add_scalar('yolov3/loss', loss, self.n_iter)
+
+            self.n_iter += 1
 
             return (
                 loss,
@@ -230,10 +258,13 @@ class YOLOLayer(nn.Module):
 class Darknet(nn.Module):
     """YOLOv3 object detection model"""
 
-    def __init__(self, config_path, img_size=416):
+    def __init__(self, config_path, monitor, img_size=416, class_weights=None):
         super(Darknet, self).__init__()
+        self.monitor = monitor
+        self.class_weights = class_weights
         self.module_defs = parse_model_config(config_path)
-        self.hyperparams, self.module_list = create_modules(self.module_defs)
+        self.hyperparams, self.module_list = create_modules(self.module_defs,
+                                                            monitor, class_weights)
         self.img_size = img_size
         self.seen = 0
         self.header_info = np.array([0, 0, 0, self.seen, 0])
